@@ -18,7 +18,14 @@ import re
 from html.parser import HTMLParser
 from pathlib import Path
 
-TEXT_EXTENSIONS = {".html", ".htm", ".txt", ".md", ".json", ".text", ""}
+TEXT_EXTENSIONS = {
+    ".html", ".htm", ".txt", ".md", ".json", ".text", "",
+    # source code / logs / config — corpora in Match 3 carry these too
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".c", ".h", ".cpp", ".hpp", ".cc",
+    ".java", ".go", ".rs", ".rb", ".php", ".sh", ".bash", ".sql", ".r", ".m",
+    ".log", ".xml", ".yml", ".yaml", ".ini", ".cfg", ".conf", ".toml",
+    ".css", ".scss", ".vue", ".svelte", ".swift", ".kt", ".dart",
+}
 PAGE_SIZE_CAP = 1_500_000  # 1.5 MB of text per file, like the contract advises
 
 STOPWORDS = {
@@ -100,6 +107,112 @@ def tokenize(text: str) -> list[str]:
             if w not in STOPWORDS and len(w) > 1]
 
 
+
+
+# ------------------------------------------------------- multi-format parsing
+# Match 3 corpora are mixed documents: PDF, DOCX, XLSX, CSV and code. DOCX and
+# XLSX are ZIP+XML so they are parsed with the standard library; PDF uses
+# pypdf when it is importable (it is installed in our image layer).
+
+def _pdf_to_text(data: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(data))
+        parts = []
+        for page in reader.pages:
+            try:
+                parts.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n\n".join(p for p in parts if p.strip())
+    except Exception:
+        return ""
+
+
+def _docx_to_text(data: bytes) -> str:
+    """Word processing XML lives in word/document.xml; w:t nodes hold text."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(io_bytes(data)) as z:
+            xml = z.read("word/document.xml")
+        root = ET.fromstring(xml)
+        ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+        parts = []
+        for para in root.iter(ns + "p"):
+            line = "".join(t.text or "" for t in para.iter(ns + "t"))
+            if line.strip():
+                parts.append(line.strip())
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _xlsx_to_text(data: bytes) -> str:
+    """Shared strings plus inline strings, one line per sheet row."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(io_bytes(data)) as z:
+            shared = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                sroot = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in sroot:
+                    shared.append("".join(
+                        t.text or "" for t in si.iter(
+                            "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}t")))
+            lines = []
+            for name in z.namelist():
+                if not (name.startswith("xl/worksheets/sheet")
+                        and name.endswith(".xml")):
+                    continue
+                wroot = ET.fromstring(z.read(name))
+                ns = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+                for row in wroot.iter(ns + "row"):
+                    cells = []
+                    for c in row.iter(ns + "c"):
+                        txt = ""
+                        if c.get("t") == "s":
+                            try:
+                                txt = shared[int(c.find(ns + "v").text)]
+                            except Exception:
+                                txt = ""
+                        elif c.get("t") == "inlineStr":
+                            txt = "".join(t.text or "" for t in c.iter(ns + "t"))
+                        else:
+                            v = c.find(ns + "v")
+                            txt = v.text if (v is not None and v.text) else ""
+                        cells.append(txt)
+                    if any(cells):
+                        lines.append(" | ".join(cells))
+            return "\n".join(lines)
+    except Exception:
+        return ""
+
+
+def _csv_to_text(data: bytes) -> str:
+    import csv
+    import io
+    try:
+        text = data.decode("utf-8-sig", "replace")
+        rows = list(csv.reader(io.StringIO(text)))
+        if not rows:
+            return ""
+        header = rows[0]
+        out = [" | ".join(header)]
+        for row in rows[1:]:
+            out.append(" | ".join(row))
+        return "\n".join(out)
+    except Exception:
+        return ""
+
+
+def io_bytes(data: bytes):
+    import io
+    return io.BytesIO(data)
+
+
 def read_page(path: Path, root: Path) -> dict | None:
     """Read one file defensively. Returns None on any failure."""
     try:
@@ -110,10 +223,23 @@ def read_page(path: Path, root: Path) -> dict | None:
         if ext not in TEXT_EXTENSIONS and not os.access(path, os.R_OK):
             return None
         data = path.read_bytes()[:PAGE_SIZE_CAP]
-        if b"\x00" in data[:4096]:
-            return None  # binary
+        if ext not in (".pdf", ".docx", ".xlsx"):
+            if b"\x00" in data[:4096]:
+                return None  # binary (zip-based formats exempt)
         if ext in (".html", ".htm"):
             text, links, title = html_to_text(data.decode("utf-8", "replace"))
+        elif ext == ".pdf":
+            text = _pdf_to_text(data)
+            links, title = [], name
+        elif ext == ".docx":
+            text = _docx_to_text(data)
+            links, title = [], name
+        elif ext == ".xlsx":
+            text = _xlsx_to_text(data)
+            links, title = [], name
+        elif ext == ".csv":
+            text = _csv_to_text(data)
+            links, title = [], name
         else:
             text = data.decode("utf-8", "replace")
             links, title = [], name
