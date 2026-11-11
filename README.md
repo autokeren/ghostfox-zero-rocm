@@ -28,10 +28,7 @@ answer instead of guessing.
 The image is built on the mandated ROCm PyTorch base (digest-pinned), with the model
 weights baked in — fully offline (`HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`).
 
-```bash
-docker pull ghcr.io/autokeren/ghostfox-zero-rocm:match4
-```
-
+Image reference is provided to the judges via the submission form only.
 Build script (crane layer-append, no Docker daemon): `tools/build.sh`
 
 ## Stack
